@@ -10,12 +10,22 @@
         position: fixed; top: 12px; left: 12px; z-index: 10;
         color: rgba(255,255,255,0.9); font: 14px system-ui;
         user-select: none;
+        line-height: 1.35;
+      }
+      #hud kbd{
+        background: rgba(255,255,255,0.12);
+        padding: 2px 6px;
+        border-radius: 6px;
+        border: 1px solid rgba(255,255,255,0.16);
       }
     </style>
   </head>
   <body>
-    <div id="hud">NYC Tabletop • If you see your map on the table, you’re good.</div>
+    <div id="hud">
+      NYC Tabletop • Click to lock mouse • <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move • <kbd>Space</kbd> jump • <kbd>Shift</kbd> sprint • <kbd>Esc</kbd> unlock
+    </div>
 
+    <!-- Three.js without npm -->
     <script type="importmap">
       {
         "imports": {
@@ -27,29 +37,62 @@
     <script type="module">
       import * as THREE from "three";
 
+      /* ----------------------------
+         Renderer / Scene / Camera
+      ---------------------------- */
       const scene = new THREE.Scene();
       scene.background = new THREE.Color(0x0b0b0b);
 
       const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 5000);
-      camera.position.set(0, 25, 60);
-      camera.lookAt(0, 10, 0);
+      camera.position.set(0, 8, 45);
 
       const renderer = new THREE.WebGLRenderer({ antialias: true });
       renderer.setSize(innerWidth, innerHeight);
       renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
       document.body.appendChild(renderer.domElement);
 
-      scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+      /* ----------------------------
+         Lighting (brighter + stable)
+      ---------------------------- */
+      scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+
       const sun = new THREE.DirectionalLight(0xffffff, 0.9);
-      sun.position.set(40, 80, 20);
+      sun.position.set(60, 120, 40);
       scene.add(sun);
 
+      // Debug helpers (leave on for now; remove later if you want)
+      scene.add(new THREE.AxesHelper(30));
+      scene.add(new THREE.GridHelper(300, 60, 0x444444, 0x222222)).position.y = 0.01;
+
+      /* ----------------------------
+         Room floor + simple "walls"
+      ---------------------------- */
       const floor = new THREE.Mesh(
-        new THREE.PlaneGeometry(300, 220),
-        new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.95 })
+        new THREE.PlaneGeometry(320, 240),
+        new THREE.MeshStandardMaterial({ color: 0x2a2a2a, roughness: 0.95 })
       );
       floor.rotation.x = -Math.PI / 2;
       scene.add(floor);
+
+      // Low perimeter rails so you perceive the room
+      function makeRail(w, h, d, x, y, z) {
+        const rail = new THREE.Mesh(
+          new THREE.BoxGeometry(w, h, d),
+          new THREE.MeshStandardMaterial({ color: 0x151515, roughness: 1.0 })
+        );
+        rail.position.set(x, y, z);
+        scene.add(rail);
+      }
+      makeRail(320, 4, 4, 0, 2, -120);
+      makeRail(320, 4, 4, 0, 2,  120);
+      makeRail(4, 4, 240, -160, 2, 0);
+      makeRail(4, 4, 240,  160, 2, 0);
+
+      /* ----------------------------
+         Table
+      ---------------------------- */
+      const table = new THREE.Group();
+      scene.add(table);
 
       const tableY = 10;
       const top = new THREE.Mesh(
@@ -57,26 +100,146 @@
         new THREE.MeshStandardMaterial({ color: 0x3a2f26, roughness: 0.9 })
       );
       top.position.y = tableY;
-      scene.add(top);
+      table.add(top);
 
-      // IMPORTANT: use relative path for GitHub Pages project sites
+      const legGeo = new THREE.BoxGeometry(4, 10, 4);
+      const legMat = new THREE.MeshStandardMaterial({ color: 0x2b221c, roughness: 0.95 });
+      for (const [x, z] of [[-66, -46], [66, -46], [-66, 46], [66, 46]]) {
+        const leg = new THREE.Mesh(legGeo, legMat);
+        leg.position.set(x, 5, z);
+        table.add(leg);
+      }
+
+      /* ----------------------------
+         Map plane (self-lit so you can see it)
+      ---------------------------- */
       const tex = new THREE.TextureLoader().load("./assets/tabletop_basemap.png");
       tex.colorSpace = THREE.SRGBColorSpace;
 
       const mapPlane = new THREE.Mesh(
-        new THREE.PlaneGeometry(130, 90),
-        new THREE.MeshStandardMaterial({ map: tex, roughness: 1.0 })
+        new THREE.PlaneGeometry(130, 90), // display size; we’ll scale “true” later
+        new THREE.MeshStandardMaterial({
+          map: tex,
+          roughness: 0.9,
+          metalness: 0.0,
+          emissive: 0xffffff,
+          emissiveIntensity: 0.35
+        })
       );
       mapPlane.rotation.x = -Math.PI / 2;
       mapPlane.position.set(0, tableY + 1.05, 0);
       scene.add(mapPlane);
 
-      function animate() {
+      /* ----------------------------
+         Simple FPS walk controls (pointer lock)
+      ---------------------------- */
+      const state = {
+        locked: false,
+        yaw: 0,
+        pitch: 0,
+        keys: new Set(),
+        vel: new THREE.Vector3(),
+        onGround: false
+      };
+
+      const player = {
+        pos: new THREE.Vector3(0, 6, 55), // start a bit away from table
+        height: 6
+      };
+
+      function lockPointer() {
+        renderer.domElement.requestPointerLock();
+      }
+      document.addEventListener("click", lockPointer);
+
+      document.addEventListener("pointerlockchange", () => {
+        state.locked = (document.pointerLockElement === renderer.domElement);
+      });
+
+      document.addEventListener("mousemove", (e) => {
+        if (!state.locked) return;
+        state.yaw   -= e.movementX * 0.0022;
+        state.pitch -= e.movementY * 0.0022;
+        state.pitch = Math.max(-1.55, Math.min(1.55, state.pitch));
+      });
+
+      document.addEventListener("keydown", (e) => state.keys.add(e.code));
+      document.addEventListener("keyup", (e) => state.keys.delete(e.code));
+
+      /* ----------------------------
+         Basic collision bounds (keep you in room)
+      ---------------------------- */
+      const ROOM_X = 150; // half-width
+      const ROOM_Z = 110; // half-depth
+
+      function clampToRoom(pos) {
+        pos.x = Math.max(-ROOM_X, Math.min(ROOM_X, pos.x));
+        pos.z = Math.max(-ROOM_Z, Math.min(ROOM_Z, pos.z));
+      }
+
+      /* ----------------------------
+         Animation loop
+      ---------------------------- */
+      let last = performance.now();
+
+      function animate(now) {
+        const dt = Math.min(0.033, (now - last) / 1000);
+        last = now;
+
+        // Apply camera rotation from mouse
+        camera.rotation.set(state.pitch, state.yaw, 0, "YXZ");
+
+        // Movement vectors in the horizontal plane
+        const forward = new THREE.Vector3(0, 0, -1).applyEuler(new THREE.Euler(0, state.yaw, 0));
+        const right   = new THREE.Vector3(1, 0,  0).applyEuler(new THREE.Euler(0, state.yaw, 0));
+
+        const baseSpeed = state.keys.has("ShiftLeft") ? 26 : 16;
+
+        const wish = new THREE.Vector3();
+        if (state.keys.has("KeyW")) wish.add(forward);
+        if (state.keys.has("KeyS")) wish.sub(forward);
+        if (state.keys.has("KeyD")) wish.add(right);
+        if (state.keys.has("KeyA")) wish.sub(right);
+
+        if (wish.lengthSq() > 0) wish.normalize().multiplyScalar(baseSpeed);
+
+        // Horizontal velocity directly from input (simple but stable)
+        state.vel.x = wish.x;
+        state.vel.z = wish.z;
+
+        // Gravity
+        state.vel.y -= 60 * dt;
+
+        // Jump
+        if (state.onGround && state.keys.has("Space")) {
+          state.vel.y = 22;
+          state.onGround = false;
+        }
+
+        // Integrate
+        player.pos.addScaledVector(state.vel, dt);
+
+        // Ground collision
+        if (player.pos.y < player.height) {
+          player.pos.y = player.height;
+          state.vel.y = 0;
+          state.onGround = true;
+        }
+
+        // Room bounds
+        clampToRoom(player.pos);
+
+        // Put camera at player
+        camera.position.copy(player.pos);
+
         renderer.render(scene, camera);
         requestAnimationFrame(animate);
       }
-      animate();
+      requestAnimationFrame(animate);
 
+      /* ----------------------------
+         Resize
+      ---------------------------- */
       addEventListener("resize", () => {
         camera.aspect = innerWidth / innerHeight;
         camera.updateProjectionMatrix();
